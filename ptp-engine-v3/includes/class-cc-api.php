@@ -276,6 +276,9 @@ class CC_API {
     // ═══════════════════════════════════════
 
     public function get_trainers() {
+        $cached = get_transient('ptp_cc_trainers_list');
+        if ($cached !== false) return $cached;
+
         global $wpdb;
         $t = CC_DB::trainers();
         $b = CC_DB::bookings();
@@ -285,7 +288,9 @@ class CC_API {
             (SELECT COUNT(*) FROM $b b WHERE b.trainer_id=t.id AND b.status IN('pending','confirmed') AND b.session_date >= CURDATE()) as upcoming
             FROM $t t WHERE t.status='approved' ORDER BY t.display_name"
         );
-        return ['trainers' => $trainers];
+        $result = ['trainers' => $trainers];
+        set_transient('ptp_cc_trainers_list', $result, 5 * MINUTE_IN_SECONDS);
+        return $result;
     }
 
     // ═══════════════════════════════════════
@@ -389,25 +394,44 @@ class CC_API {
             $camp_campers = (int)$wpdb->get_var("SELECT COUNT(*) FROM $ci");
         }
 
+        // ── Consolidated stats: 12 separate COUNT queries → 2 queries ──
+        $app_stats = $wpdb->get_row("SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN status='accepted' THEN 1 ELSE 0 END) as accepted,
+            SUM(CASE WHEN status='converted' THEN 1 ELSE 0 END) as converted,
+            SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today,
+            SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) as week
+            FROM $at");
+
+        $other = $wpdb->get_row("SELECT
+            (SELECT COUNT(*) FROM $pt) as parents_total,
+            (SELECT COUNT(*) FROM $bt WHERE status IN('pending','confirmed') AND session_date >= CURDATE()) as bookings_upcoming,
+            (SELECT COUNT(*) FROM $bt WHERE status='completed') as bookings_completed,
+            (SELECT COUNT(*) FROM $tt WHERE status='approved') as trainers_active,
+            (SELECT COUNT(*) FROM $dt WHERE status='pending') as pending_drafts");
+
+        $fu = CC_DB::follow_ups();
+
         return [
-            'apps_total' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $at"),
-            'apps_pending' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $at WHERE status='pending'"),
-            'apps_accepted' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $at WHERE status='accepted'"),
-            'apps_converted' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $at WHERE status='converted'"),
-            'apps_today' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $at WHERE DATE(created_at) = CURDATE()"),
-            'apps_week' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $at WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)"),
-            'parents_total' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $pt"),
-            'bookings_upcoming' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $bt WHERE status IN('pending','confirmed') AND session_date >= CURDATE()"),
-            'bookings_completed' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $bt WHERE status='completed'"),
-            'trainers_active' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $tt WHERE status='approved'"),
-            'pending_drafts' => (int)$wpdb->get_var("SELECT COUNT(*) FROM $dt WHERE status='pending'"),
+            'apps_total' => (int)$app_stats->total,
+            'apps_pending' => (int)$app_stats->pending,
+            'apps_accepted' => (int)$app_stats->accepted,
+            'apps_converted' => (int)$app_stats->converted,
+            'apps_today' => (int)$app_stats->today,
+            'apps_week' => (int)$app_stats->week,
+            'parents_total' => (int)$other->parents_total,
+            'bookings_upcoming' => (int)$other->bookings_upcoming,
+            'bookings_completed' => (int)$other->bookings_completed,
+            'trainers_active' => (int)$other->trainers_active,
+            'pending_drafts' => (int)$other->pending_drafts,
             // Camp stats
             'camp_orders' => $camp_orders,
             'camp_revenue' => $camp_revenue,
             'camp_campers' => $camp_campers,
             'needs_follow_up' => $wpdb->get_results(
                 "SELECT a.*, DATEDIFF(NOW(), COALESCE(a.accepted_at, a.created_at)) as days_since,
-                (SELECT COUNT(*) FROM " . CC_DB::follow_ups() . " f WHERE f.app_id=a.id) as fu_count
+                (SELECT COUNT(*) FROM $fu f WHERE f.app_id=a.id) as fu_count
                 FROM $at a WHERE a.status IN('pending','accepted','contacted')
                 AND DATEDIFF(NOW(), COALESCE(a.accepted_at, a.created_at)) >= 1
                 ORDER BY a.created_at ASC LIMIT 20"
@@ -488,26 +512,23 @@ class CC_API {
         $fu = CC_DB::follow_ups();
         $mt = CC_DB::op_msgs();
 
+        // Single query: includes response check via subquery (eliminates N+1 loop)
         $apps = $wpdb->get_results(
             "SELECT a.id, a.parent_name, a.child_name, a.phone, a.email, a.status,
             a.trainer_name, a.lead_temperature, a.created_at, a.accepted_at,
             (SELECT COUNT(*) FROM $fu f WHERE f.app_id=a.id) as fu_count,
             (SELECT MAX(sent_at) FROM $fu f WHERE f.app_id=a.id) as last_fu,
-            TIMESTAMPDIFF(HOUR, COALESCE(a.accepted_at, a.created_at), NOW()) as hours_since
+            TIMESTAMPDIFF(HOUR, COALESCE(a.accepted_at, a.created_at), NOW()) as hours_since,
+            (SELECT COUNT(*) FROM $mt m WHERE m.app_id=a.id AND m.direction='incoming'
+                AND m.created_at > COALESCE((SELECT MAX(f2.sent_at) FROM $fu f2 WHERE f2.app_id=a.id), '1970-01-01')
+            ) as responses_after_last_fu
             FROM $at a WHERE a.status IN('pending','accepted','contacted')
             ORDER BY a.created_at DESC"
         );
 
         $sequences = [];
         foreach ($apps as $a) {
-            $has_response = false;
-            if ($a->last_fu) {
-                $resp = (int)$wpdb->get_var($wpdb->prepare(
-                    "SELECT COUNT(*) FROM $mt WHERE app_id=%d AND direction='incoming' AND created_at > %s",
-                    $a->id, $a->last_fu
-                ));
-                $has_response = $resp > 0;
-            }
+            $has_response = $a->last_fu && (int)$a->responses_after_last_fu > 0;
             $sequences[] = [
                 'app_id' => $a->id, 'name' => $a->parent_name, 'child' => $a->child_name,
                 'phone' => $a->phone, 'trainer' => $a->trainer_name,
@@ -1404,6 +1425,7 @@ class CC_API {
         ]);
 
         CC_DB::log('trainer_created', 'trainer', $wpdb->insert_id, $name, 'admin');
+        delete_transient('ptp_cc_trainers_list');
         return ['success' => true, 'id' => $wpdb->insert_id];
     }
 
@@ -1425,7 +1447,10 @@ class CC_API {
                 }
             }
         }
-        if (!empty($data)) $wpdb->update(CC_DB::trainers(), $data, ['id' => (int)$req['id']]);
+        if (!empty($data)) {
+            $wpdb->update(CC_DB::trainers(), $data, ['id' => (int)$req['id']]);
+            delete_transient('ptp_cc_trainers_list');
+        }
         return ['success' => true];
     }
 

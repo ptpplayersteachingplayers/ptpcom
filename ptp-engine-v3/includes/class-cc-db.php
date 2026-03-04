@@ -160,7 +160,8 @@ class CC_DB {
                 KEY status (status),
                 KEY email (email),
                 KEY phone (phone),
-                KEY created_at (created_at)
+                KEY created_at (created_at),
+                KEY status_created (status, created_at)
             ) $c;");
         }
 
@@ -246,7 +247,9 @@ class CC_DB {
                 KEY trainer_id (trainer_id),
                 KEY session_date (session_date),
                 KEY status (status),
-                KEY training_link_id (training_link_id)
+                KEY training_link_id (training_link_id),
+                KEY parent_payment (parent_id, payment_status),
+                KEY trainer_status_date (trainer_id, status, session_date)
             ) $c;");
         }
 
@@ -303,7 +306,8 @@ class CC_DB {
             response_at datetime DEFAULT NULL,
             created_at datetime DEFAULT CURRENT_TIMESTAMP,
             KEY app_id (app_id),
-            KEY parent_id (parent_id)
+            KEY parent_id (parent_id),
+            KEY app_sent (app_id, sent_at)
         ) $c;");
 
         dbDelta("CREATE TABLE IF NOT EXISTS " . self::op_msgs() . " (
@@ -320,7 +324,8 @@ class CC_DB {
             KEY phone (phone),
             KEY openphone_msg_id (openphone_msg_id),
             KEY phone_date (phone, created_at),
-            KEY phone_dir (phone, direction)
+            KEY phone_dir (phone, direction),
+            KEY app_dir (app_id, direction, created_at)
         ) $c;");
 
         dbDelta("CREATE TABLE IF NOT EXISTS " . self::drafts() . " (
